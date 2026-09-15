@@ -11,7 +11,7 @@
 
 Cross-subject Auditory Attention Decoding (AAD) remains challenging due to substantial inter-subject variability and limited model interpretability. We propose **NeuroMaskNet**, an explainable framework that integrates a Structured NeuroMask Module (SNM), a shared spatio-temporal Transformer, NeuroSpatial Attention Fusion (NSAF), and information-bottleneck-guided disentanglement.
 
-SNM generates anatomically isolated EEG views, while NSAF models region-specific neural relevance for interpretable decoding. Meanwhile, the disentanglement module separates task-relevant, subject-invariant information from subject-specific factors to improve generalization to unseen subjects. NeuroMaskNet achieves strong cross-subject performance on the KUL, DTU, and AVED datasets.
+SNM generates anatomically isolated EEG views, while NSAF models region-specific neural relevance for interpretable decoding. The disentanglement module separates task-relevant, subject-invariant information from subject-specific factors to improve generalization to unseen subjects. NeuroMaskNet achieves strong cross-subject performance on the KUL, DTU, and AVED datasets.
 
 ---
 
@@ -28,6 +28,8 @@ NeuroMaskNet consists of four main components:
 3. **NeuroSpatial Attention Fusion (NSAF)** – adaptively models regional relevance.
 4. **Disentanglement Head** – separates task-relevant and subject-specific representations.
 
+---
+
 ## Installation & Usage
 
 ```bash
@@ -36,6 +38,8 @@ conda activate neuromask
 pip install torch numpy pandas scikit-learn tqdm matplotlib
 python neuromask-net
 ```
+
+---
 
 ## Main Results
 
@@ -55,3 +59,96 @@ python neuromask-net
 |  | DARNet | 55.6 ± 4.1 | 55.6 ± 4.0 |
 |  | FD-ARL | 57.7 ± 4.68 | 58.1 ± 4.42 |
 |  | **NeuroMaskNet (Ours)** | **57.8 ± 3.5** | **59.1 ± 3.7** |
+| **AVED-Audio** | SSF-CNN | 51.2 ± 3.1 | 51.4 ± 3.9 |
+|  | DBPNet | 52.1 ± 4.2 | 52.8 ± 4.3 |
+|  | ListenNet | 51.4 ± 4.2 | 52.6 ± 4.1 |
+|  | DARNet | 52.3 ± 3.1 | 52.3 ± 3.1 |
+|  | FD-ARL | 53.7 ± 3.6 | 54.1 ± 4.2 |
+|  | **NeuroMaskNet (Ours)** | **54.9 ± 3.7** | **55.3 ± 3.1** |
+| **AVED-Video** | SSF-CNN | 51.4 ± 3.5 | 51.5 ± 3.2 |
+|  | DBPNet | 51.8 ± 3.4 | 52.2 ± 3.1 |
+|  | ListenNet | 51.6 ± 3.2 | 52.7 ± 3.0 |
+|  | DARNet | 52.4 ± 3.1 | 53.4 ± 3.2 |
+|  | FD-ARL | 53.9 ± 3.5 | 54.4 ± 3.9 |
+|  | **NeuroMaskNet (Ours)** | **56.1 ± 3.5** | **56.3 ± 3.3** |
+
+---
+
+## Ablation Study
+
+Ablation experiments are conducted on DTU using a 1-second EEG window.
+
+| Method | Accuracy (%) |
+| --- | ---: |
+| **NeuroMaskNet (Ours)** | **57.8 ± 3.5** |
+| w/o pro, SIB, adv, recon | 56.3 ± 4.42 |
+| w/o pro, SIB | 56.9 ± 4.17 |
+| w/o adv, recon | 56.0 ± 4.21 |
+| w/o Spat | 55.6 ± 5.56 |
+| w/o Temp | 51.3 ± 7.66 |
+| w/o SNM, NSAF | 56.2 ± 4.32 |
+
+---
+
+## Interpretability Analysis
+
+### Regional Spatial Relevance
+
+The learned spatial-attention patterns provide anatomical interpretation of the EEG regions contributing to AAD decisions.
+
+<p align="center">
+  <img src="neuromask_average_regional_heatmap_4plotsf%20(1).png" width="90%">
+</p>
+
+[View regional relevance visualization](neuromask_average_regional_heatmap_4plotsf%20(1).png)
+
+---
+
+## Representation Visualization
+
+t-SNE visualizations illustrate the separation between task-relevant and subject-specific representations.
+
+### KUL
+
+<p align="center">
+  <img src="tskulf.png" width="85%">
+</p>
+
+[View KUL t-SNE](tskulf.png)
+
+### DTU
+
+<p align="center">
+  <img src="tsinedtuf.png" width="85%">
+</p>
+
+[View DTU t-SNE](tsinedtuf.png)
+
+### AVED
+
+<p align="center">
+  <img src="tsineavedf.png" width="85%">
+</p>
+
+[View AVED t-SNE](tsineavedf.png)
+
+---
+
+## Citation
+
+If you find this work useful, please consider citing our work:
+
+```bibtex
+@misc{kausar2027neuromasknet,
+  title  = {NeuroMaskNet: Explainable Cross-Subject Auditory Attention Decoding},
+  author = {Tasleem Kausar and Haizhou Li},
+  year   = {2027},
+  note   = {Submitted to IEEE ICASSP 2027}
+}
+```
+
+---
+
+## Acknowledgment
+
+This repository provides the implementation and experimental results of **NeuroMaskNet** for explainable cross-subject Auditory Attention Decoding.
