@@ -796,7 +796,7 @@ class TrainingConfig:
         
 
         self.learning_rate = 1e-4
-        self.epochs = 50
+        self.epochs = 100
         self.weight_decay = 1e-3
         self.patience = 10
         self.factor = 0.5
