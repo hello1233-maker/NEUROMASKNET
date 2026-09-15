@@ -18,7 +18,7 @@ SNM generates anatomically isolated EEG views, while NSAF models region-specific
 ## Model Architecture
 
 <p align="center">
-  <img src="figures/framework.png" width="95%">
+  <img src="finalmodel.png" width="95%">
 </p>
 
 NeuroMaskNet consists of four main components:
