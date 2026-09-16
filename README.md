@@ -2,7 +2,7 @@
 
 ![Conference](https://img.shields.io/badge/Conference-ICASSP%202027-blue)
 
-**Authors:** Tasleem Kausar, Haizhou Li  
+**Authors:** Tasleem Kausar, Yun Lu  
 **Affiliation:** School of Artificial Intelligence, The Chinese University of Hong Kong, Shenzhen, China
 
 ---
