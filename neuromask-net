@@ -708,69 +708,6 @@ def run_training_session_dann(train_loader, test_loader, config, num_domain_clas
 
     return best_test_acc
 
-def plot_tsne_train_test_subjects(model, train_loader, test_loader, device, save_path, test_sub_id):
-    """TSNE Visualization (Adapted for NeuroMask model)"""
-    model.eval()
-    z_task_list, z_domain_list = [], []
-    labels_dir, labels_subj = [], []
-    is_test_flag = []
-
-    with torch.no_grad():
-
-        def extract_batch(eeg):
-            feat_dict = model.extract_disentangled_features(eeg)
-            return feat_dict['z_task'].cpu().numpy(), feat_dict['z_domain'].cpu().numpy()
-
-        for batch in train_loader:
-            eeg, direction_labels, domain_labels = [d.to(device) for d in batch]
-            z_t, z_d = extract_batch(eeg)
-            z_task_list.append(z_t)
-            z_domain_list.append(z_d)
-            labels_dir.extend(direction_labels.cpu().numpy())
-            labels_subj.extend(domain_labels.cpu().numpy())
-            is_test_flag.extend([False] * eeg.size(0))
-
-        for batch in test_loader:
-            eeg, direction_labels, domain_labels = [d.to(device) for d in batch]
-            z_t, z_d = extract_batch(eeg)
-            z_task_list.append(z_t)
-            z_domain_list.append(z_d)
-            labels_dir.extend(direction_labels.cpu().numpy())
-            labels_subj.extend(domain_labels.cpu().numpy())
-            is_test_flag.extend([True] * eeg.size(0))
-
-    ztask_all = np.vstack(z_task_list)
-    zdom_all = np.vstack(z_domain_list)
-    labels_dir = np.array(labels_dir)
-    labels_subj = np.array(labels_subj)
-    is_test_flag = np.array(is_test_flag)
-
-    tsne = TSNE(n_components=2, perplexity=30, n_iter=1000, random_state=42)
-    ztask_2d = tsne.fit_transform(ztask_all)
-    zdom_2d = tsne.fit_transform(zdom_all)
-
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-    test_mask = is_test_flag == True
-    
-
-    axes[0].scatter(ztask_2d[test_mask, 0], ztask_2d[test_mask, 1], 
-                    c=['blue' if l == 0 else 'red' for l in labels_dir[test_mask]], alpha=0.7)
-    axes[0].set_title(f"z_task (Test Sub {test_sub_id})")
-    axes[0].grid(True, alpha=0.3)
-
-
-    num_train_subs = len(np.unique(labels_subj[~is_test_flag]))
-    cmap = plt.get_cmap('tab20', num_train_subs)
-    colors = [cmap(labels_subj[i] % num_train_subs) if not is_test_flag[i] else 'black' for i in range(len(labels_subj))]
-    axes[1].scatter(zdom_2d[:, 0], zdom_2d[:, 1], c=colors, alpha=0.6, s=10)
-    axes[1].set_title("z_domain (Train + Test)")
-    axes[1].grid(True, alpha=0.3)
-
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=300)
-    plt.close(fig)
-
-
 
 
 class TrainingConfig:
