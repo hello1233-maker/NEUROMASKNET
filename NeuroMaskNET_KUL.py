@@ -1,0 +1,900 @@
+import json
+import math
+import os
+import random
+import re
+import time
+import warnings
+from datetime import datetime
+from typing import Tuple, Dict, List
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from sklearn.model_selection import train_test_split
+from torch.autograd import Function
+from torch.utils.data import DataLoader, Dataset, Subset
+from tqdm import tqdm
+from torch.nn.init import trunc_normal_
+import matplotlib.pyplot as plt
+from sklearn.manifold import TSNE
+
+
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+
+
+class AvgMeter:
+    def __init__(self, name="Metric"):
+        self.name = name
+        self.reset()
+    def reset(self):
+        self.avg, self.sum, self.count = [0] * 3
+    def update(self, val, count=1):
+        self.count += count
+        self.sum += val * count
+        self.avg = self.sum / self.count
+    def __repr__(self):
+        return f"{self.name}: {self.avg:.4f}"
+
+def get_lr(optimizer):
+    for param_group in optimizer.param_groups:
+        return param_group["lr"]
+
+
+
+
+class KUL_AAD_Dataset(Dataset):
+    """
+    KUL loader adapted to the exact Disentangled_NeuroMask model/training
+    pipeline used for the DTU version.
+
+    Expected files:
+        root/s1.npz, root/s2.npz, ..., root/s16.npz
+
+    Expected NPZ keys:
+        eeg : EEG segments
+        ear : binary attended-direction labels
+
+    Each sample is returned as [64, 128].
+    """
+    def __init__(self, root, subject_ids, all_subject_ids_map):
+        self.root = root
+        self.data_cache = {}
+        self.index_map = []
+        self.domain_label_map = all_subject_ids_map
+
+        for s_id in subject_ids:
+            file_path = os.path.join(root, f"s{s_id}.npz")
+            if not os.path.exists(file_path):
+                warnings.warn(f"Data file not found for subject {s_id}: {file_path}")
+                continue
+
+            data = np.load(file_path, allow_pickle=True)
+            if "eeg" not in data:
+                raise KeyError(f"{file_path} does not contain key 'eeg'.")
+            if "ear" not in data:
+                raise KeyError(f"{file_path} does not contain key 'ear'.")
+
+            eeg_data = torch.tensor(data["eeg"], dtype=torch.float32)
+
+            # Same per-sample min-max normalization as the supplied KUL code.
+            eeg_min = torch.min(eeg_data, dim=-1, keepdim=True)[0]
+            eeg_max = torch.max(eeg_data, dim=-1, keepdim=True)[0]
+            eeg_normalized = (eeg_data - eeg_min) / (
+                eeg_max - eeg_min + 1e-8
+            )
+
+            labels = torch.tensor(
+                np.asarray(data["ear"]).squeeze(), dtype=torch.long
+            ).view(-1)
+
+            if len(eeg_normalized) != len(labels):
+                raise ValueError(
+                    f"{file_path}: EEG samples ({len(eeg_normalized)}) "
+                    f"!= labels ({len(labels)})."
+                )
+
+            self.data_cache[str(s_id)] = {
+                "eeg": eeg_normalized,
+                "direction_label": labels
+            }
+
+            for i in range(len(eeg_normalized)):
+                self.index_map.append({
+                    "subject_id": str(s_id),
+                    "sample_idx": i
+                })
+
+        if not self.index_map:
+            raise RuntimeError(
+                f"Dataset is empty (Subjects: {subject_ids}). "
+                f"Please check path: {root}"
+            )
+
+    def __len__(self):
+        return len(self.index_map)
+
+    def __getitem__(self, idx):
+        entry = self.index_map[idx]
+        s_id = entry["subject_id"]
+        sample_idx = entry["sample_idx"]
+
+        subject_data = self.data_cache[s_id]
+        eeg = subject_data["eeg"][sample_idx]
+        direction_label = subject_data["direction_label"][sample_idx]
+
+        # Accept both [64,128] and [128,64], always return [64,128].
+        if eeg.dim() == 3:
+            eeg = eeg.squeeze(0)
+
+        if eeg.shape == (128, 64):
+            eeg = eeg.transpose(0, 1)
+        elif eeg.shape == (64, 128):
+            pass
+        elif eeg.numel() == 64 * 128:
+            eeg = eeg.reshape(64, 128)
+        else:
+            raise ValueError(
+                f"Unexpected KUL EEG shape for subject {s_id}, "
+                f"sample {sample_idx}: {tuple(eeg.shape)}. "
+                f"Expected (64,128) or (128,64)."
+            )
+
+        domain_label = self.domain_label_map.get(s_id, -1)
+        return eeg, direction_label, torch.tensor(domain_label, dtype=torch.long)
+
+
+CHANNEL_NAMES_64 = [
+    "Fp1", "Fp2", "AF7", "AF3", "AFz", "AF4", "AF8",
+    "F7", "F5", "F3", "F1", "Fz", "F2", "F4", "F6", "F8",
+    "FT7", "FC5", "FC3", "FC1", "FCz", "FC2", "FC4", "FC6", "FT8",
+    "T7", "C5", "C3", "C1", "Cz", "C2", "C4", "C6", "T8",
+    "TP7", "CP5", "CP3", "CP1", "CPz", "CP2", "CP4", "CP6", "TP8",
+    "P7", "P5", "P3", "P1", "Pz", "P2", "P4", "P6", "P8",
+    "PO7", "PO3", "POz", "PO4", "PO8",
+    "O1", "Oz", "O2"
+]
+
+def get_spatial_regions_64():
+    """10 spatial regions from the supplied KUL code."""
+    return {
+        "R1_Pre-Frontal": ["Fp1", "Fp2", "AF7", "AF3", "AFz", "AF4", "AF8"],
+        "R2_Frontal": ["F1", "Fz", "F2"],
+        "R3_Left_Frontal-Central": ["F7", "F5", "F3", "FC5", "FC3", "FT7"],
+        "R4_Right_Frontal-Central": ["F4", "F6", "F8", "FC4", "FC6", "FT8"],
+        "R5_Left_Temporal-Central": ["T7", "C5", "C3", "CP5", "CP3", "TP7"],
+        "R6_Right_Temporal-Central": ["C4", "C6", "T8", "CP4", "CP6", "TP8"],
+        "R7_Central": ["C1", "Cz", "C2", "FC1", "FCz", "FC2",
+                       "CP1", "CPz", "CP2"],
+        "R8_Left_Parietal-Occipital": ["P7", "P5", "P3", "PO7", "PO3"],
+        "R9_Right_Parietal-Occipital": ["P4", "P6", "P8", "PO4", "PO8"],
+        "R10_Midline_Parietal-Occipital": ["P1", "Pz", "P2", "POz", "O1", "Oz", "O2"]
+    }
+
+def get_spatial_masks(device, num_channels=64):
+    regions = get_spatial_regions_64()
+    active_channels = CHANNEL_NAMES_64[:num_channels]
+    ch_to_idx = {ch: idx for idx, ch in enumerate(active_channels)}
+    masks, region_names = [], []
+
+    for region_name, region_channels in regions.items():
+        m = torch.zeros(num_channels, device=device)
+        for ch in region_channels:
+            if ch in ch_to_idx:
+                m[ch_to_idx[ch]] = 1.0
+        masks.append(m)
+        region_names.append(re.sub(r"^R\d+_", "", region_name))
+
+    return masks, region_names
+
+
+class GradientReversalFunction(Function):
+    @staticmethod
+    def forward(ctx, x, alpha):
+        ctx.alpha = alpha
+        return x.view_as(x)
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output.neg() * ctx.alpha, None
+
+class GradientReversalLayer(nn.Module):
+    def __init__(self, alpha: float = 1.0):
+        super().__init__()
+        self.alpha = alpha
+    def forward(self, x: torch.Tensor, alpha: float = None) -> torch.Tensor:
+        return GradientReversalFunction.apply(x, alpha if alpha is not None else self.alpha)
+
+class OrthogonalDecomposer(nn.Module):
+    def __init__(self, hidden_size):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.P = nn.Parameter(torch.eye(hidden_size))  
+        self.ortho_reg = nn.MSELoss()
+
+    def forward(self, z):
+        z_task = torch.matmul(z, self.P)
+        z_domain = z - z_task
+        ortho_loss = self.ortho_reg(
+            torch.matmul(self.P.T, self.P), 
+            torch.eye(self.hidden_size, device=z.device)
+        )
+        return z_task, z_domain, ortho_loss
+
+class Stem(nn.Module):
+    def __init__(self, in_planes: int, out_planes: int, kernel_size: int, patch_size: int, radix: int = 1):
+        super().__init__()
+        self.radix, self.in_planes, self.out_planes = radix, in_planes, out_planes
+        self.mid_planes = out_planes * radix
+        self.sconv = nn.Conv1d(in_planes, self.mid_planes, 1, bias=False, groups=radix)
+        self.bn1 = nn.BatchNorm1d(self.mid_planes)
+
+        ks_list = [max(3, kernel_size // (2**i)) for i in range(radix)]
+        ks_list = [k if k % 2 == 1 else k + 1 for k in ks_list]
+        
+        self.tconv = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv1d(out_planes, out_planes, ks, 1, padding=ks // 2, bias=False, groups=out_planes),
+                nn.BatchNorm1d(out_planes)
+            ) for ks in ks_list
+        ])
+        self.downSampling = nn.AvgPool1d(patch_size, stride=patch_size)
+        self.dp = nn.Dropout(0.5)
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = self.bn1(self.sconv(x))
+        branches = torch.split(out, self.out_planes, dim=1) if self.radix > 1 else [out]
+        out = [conv(branch) for conv, branch in zip(self.tconv, branches)]
+        out = F.gelu(sum(out))
+        return self.dp(self.downSampling(out))
+
+class PatchEmbeddingTemporal(nn.Module):
+    def __init__(self, chn: int, patch_size: int, emb_size: int):
+        super().__init__()
+        self.stem = Stem(in_planes=chn, out_planes=emb_size, kernel_size=63, patch_size=patch_size)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.stem(x).permute(0, 2, 1)
+
+class PatchEmbeddingSpatial(nn.Module):
+    def __init__(self, spa_dim: int, emb_size: int):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Conv1d(1, spa_dim, 25, 5, 12), nn.ELU(),
+            nn.AdaptiveAvgPool1d(1), nn.Flatten(), nn.Linear(spa_dim, emb_size)
+        )
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, C, T = x.shape
+        return self.encoder(x.unsqueeze(1).reshape(B * C, 1, T)).view(B, C, -1)
+
+
+
+
+class Disentangled_NeuroMask(nn.Module):
+    def __init__(self,
+                 chn: int, time_sample_num: int, patch_size: int, spa_dim: int,
+                 num_direction_classes: int = 2, num_domain_classes: int = 2,
+                 emb_size: int = 128, depth: int = 2, num_heads: int = 8,
+                 use_neuromask: bool = True):
+        super().__init__()
+        
+        self.use_neuromask = use_neuromask
+        self.chn = chn
+        self.emb_size = emb_size
+        
+
+        self.temporal_embedding = PatchEmbeddingTemporal(chn, patch_size, emb_size)
+        self.spatial_embedding = PatchEmbeddingSpatial(spa_dim, emb_size)
+        
+        self.P = time_sample_num // patch_size
+        self.C = chn
+        
+        self.pos_embedding_temporal = nn.Parameter(torch.randn(1, self.P, emb_size))
+        self.pos_embedding_spatial = nn.Parameter(torch.randn(1, self.C, emb_size))
+        
+        encoder_layer = lambda: nn.TransformerEncoderLayer(
+            d_model=emb_size, nhead=num_heads, dim_feedforward=emb_size * 4,
+            dropout=0.5, activation='gelu', batch_first=True
+        )
+        self.temporal_transformer = nn.TransformerEncoder(encoder_layer(), num_layers=depth)
+        self.spatial_transformer = nn.TransformerEncoder(encoder_layer(), num_layers=depth)
+
+        self.spatial_attn_pool = nn.Sequential(
+            nn.Linear(emb_size, emb_size),
+            nn.Tanh(),
+            nn.Linear(emb_size, 1)
+        )
+        
+
+
+
+
+
+
+        self.nsaf_W = nn.Linear(emb_size * 2, emb_size * 2, bias=True)
+        self.nsaf_w = nn.Linear(emb_size * 2, 1, bias=False)
+
+        self.encoding_head = nn.Sequential(
+            nn.Linear(emb_size * 2, emb_size),
+            nn.LeakyReLU(0.2)
+        )
+        self.ortho_decomposer = OrthogonalDecomposer(emb_size)
+        
+
+        self.domain_classifier_bottleneck = nn.Sequential(
+            nn.Linear(emb_size, 64), nn.ReLU(), nn.Linear(64, num_domain_classes)
+        )
+        self.kl_div = nn.KLDivLoss(reduction="batchmean")
+        
+
+        self.decoder_conv = nn.Sequential(
+            nn.ConvTranspose1d(1, chn, kernel_size=4, stride=2, padding=1),
+            nn.LeakyReLU(0.2),
+            nn.AdaptiveAvgPool1d(emb_size)
+        )
+        self.decoder_linear = nn.Linear(emb_size, time_sample_num)
+        
+        self.grl = GradientReversalLayer()
+        self.label_classifier = nn.Sequential(
+            nn.Linear(emb_size, 64), nn.ReLU(), nn.Dropout(0.2),
+            nn.Linear(64, num_direction_classes)
+        )
+        self.domain_classifier = nn.Sequential(
+            nn.Linear(emb_size, 64), nn.ReLU(), nn.Dropout(0.2),
+            nn.Linear(64, num_domain_classes)
+        )
+        
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m: nn.Module):
+        if isinstance(m, nn.Linear):
+            trunc_normal_(m.weight, std=.02)
+            if m.bias is not None: nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+    
+    def _extract_single_branch_features(self, x: torch.Tensor):
+        """Helper to run the dual-branch transformer on a single input tensor (Full or Masked)"""
+        x_embed_temporal = self.temporal_embedding(x) + self.pos_embedding_temporal
+        x_temporal = self.temporal_transformer(x_embed_temporal)
+        x_t = x_temporal.mean(dim=1)
+        
+        x_embed_spatial = self.spatial_embedding(x) + self.pos_embedding_spatial
+        x_spatial = self.spatial_transformer(x_embed_spatial)
+        attn_scores = self.spatial_attn_pool(x_spatial)
+        attn_weights = torch.softmax(attn_scores, dim=1)
+        x_s = torch.sum(attn_weights * x_spatial, dim=1)
+        
+        return torch.cat([x_t, x_s], dim=-1)
+
+    def extract_disentangled_features(self, x: torch.Tensor):
+        """
+        Main Feature Extraction with NeuroMask Fusion.
+        Computes features for Full Signal + 10 Regions, then fuses them using learned attention.
+        """
+        B, C, T = x.shape
+        device = x.device
+
+        if self.use_neuromask:
+            spatial_masks, _ = get_spatial_masks(device, num_channels=C)
+            
+
+            full_feat = self._extract_single_branch_features(x)
+            feature_stack = [full_feat.unsqueeze(1)]
+
+
+            for mask in spatial_masks:
+                x_masked = x * mask.view(1, C, 1)
+                region_feat = self._extract_single_branch_features(x_masked)
+                feature_stack.append(region_feat.unsqueeze(1))
+            
+
+            feature_stack = torch.cat(feature_stack, dim=1)
+
+
+
+
+            nsaf_hidden = torch.tanh(self.nsaf_W(feature_stack))
+            view_scores = self.nsaf_w(nsaf_hidden).squeeze(-1)
+
+
+
+            attention_weights = torch.softmax(view_scores, dim=1)
+
+
+            z_fused_input = torch.sum(
+                feature_stack * attention_weights.unsqueeze(-1),
+                dim=1
+            )
+        else:
+
+            z_fused_input = self._extract_single_branch_features(x)
+            attention_weights = None
+
+
+        z = self.encoding_head(z_fused_input)
+        z_task, z_domain, ortho_loss = self.ortho_decomposer(z)
+
+        return {
+            "x_fused": z_fused_input,
+            "z": z,
+            "z_task": z_task,
+            "z_domain": z_domain,
+            "ortho_loss": ortho_loss,
+            "attention_weights": attention_weights
+        }
+
+    def forward(self, x: torch.Tensor, alpha: float = 1.0):
+        feat_dict = self.extract_disentangled_features(x)
+        
+        z = feat_dict["z"]
+        z_task = feat_dict["z_task"]
+        z_domain = feat_dict["z_domain"]
+        ortho_loss = feat_dict["ortho_loss"]
+
+
+        domain_logits_z = self.domain_classifier_bottleneck(z)
+        domain_logits_z_domain = self.domain_classifier_bottleneck(z_domain)
+        sufficiency_loss = self.kl_div(
+            F.log_softmax(domain_logits_z_domain, dim=1),
+            F.softmax(domain_logits_z, dim=1)
+        )
+        
+        mu = z_domain.mean(dim=1, keepdim=True)
+        sigma = z_domain.std(dim=1, keepdim=True) + 1e-8
+        kl_loss = 0.5 * (mu**2 + sigma**2 - 1 - torch.log(sigma**2)).mean()
+
+
+        z_combined_for_decoder = torch.cat([z_task, z_domain], dim=1)
+        z_reshaped_for_decoder = z_combined_for_decoder.unsqueeze(1)
+        x_decoded_conv = self.decoder_conv(z_reshaped_for_decoder)
+        reconstructed_x = self.decoder_linear(x_decoded_conv)
+
+
+        label_output = self.label_classifier(z_task)
+
+
+
+
+        reversed_z_task = self.grl(z_task, alpha)
+        domain_output = self.domain_classifier(reversed_z_task)
+
+        return (
+            label_output, 
+            domain_output, 
+            reconstructed_x, 
+            ortho_loss, 
+            sufficiency_loss, 
+            kl_loss
+        )
+
+    @torch.no_grad()
+    def get_nsaf_attention(self, x: torch.Tensor):
+        """Return sample-dependent NSAF coefficients for an EEG batch.
+
+        Args:
+            x: EEG tensor of shape [B, C, T].
+
+        Returns:
+            Tensor of shape [B, 11]. Column 0 is the Full Signal coefficient
+            and columns 1--10 correspond to the ten anatomical regions.
+        """
+        was_training = self.training
+        self.eval()
+        feat_dict = self.extract_disentangled_features(x)
+        if was_training:
+            self.train()
+        return feat_dict["attention_weights"]
+
+
+
+@torch.no_grad()
+def average_nsaf_attention(model, dataloader, device):
+    """Average sample-dependent NSAF coefficients over EEG segments."""
+    model.eval()
+    attention_sum = None
+    sample_count = 0
+
+    for batch in dataloader:
+        eeg = batch[0].to(device)
+        weights = model.get_nsaf_attention(eeg)
+
+        if weights is None:
+            return None
+
+        batch_sum = weights.sum(dim=0)
+        attention_sum = batch_sum if attention_sum is None else attention_sum + batch_sum
+        sample_count += weights.size(0)
+
+    if sample_count == 0:
+        return None
+
+    return (attention_sum / sample_count).detach().cpu().numpy()
+
+
+
+
+
+class DannTrainer:
+    def __init__(self, model, optimizer=None, lr_scheduler=None, config=None):
+        self.model = model
+        self.optimizer = optimizer
+        self.lr_scheduler = lr_scheduler
+        self.config = config
+        self.label_criterion = nn.CrossEntropyLoss()
+        self.domain_criterion = nn.CrossEntropyLoss()
+        self.recon_criterion = nn.MSELoss()
+        self.metrics = self._init_metrics()
+
+    def _init_metrics(self):
+        return {
+            'train_total_loss': AvgMeter("Total"),
+            'train_label_loss': AvgMeter("Label"),
+            'train_domain_loss': AvgMeter("Domain"),
+            'train_recon_loss': AvgMeter("Recon"),
+            'train_ortho_loss': AvgMeter("Ortho"),
+            'train_suff_loss': AvgMeter("Suff"),
+            'train_kl_loss': AvgMeter("KL"),
+            'train_label_acc': AvgMeter("L_Acc"),
+            'train_domain_acc': AvgMeter("D_Acc"),
+            'test_label_loss': AvgMeter("Test_Loss"),
+            'test_label_acc': AvgMeter("Test_Acc")
+        }
+
+    def run_epoch(self, dataloader, mode='train', epoch=0):
+        self.model.train() if mode == 'train' else self.model.eval()
+        for key, meter in self.metrics.items():
+            meter.reset()
+        
+        pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{self.config.epochs} [{mode.capitalize()}]")
+        
+        with torch.set_grad_enabled(mode == 'train'):
+            for batch in pbar:
+                eeg, direction_labels, domain_labels = [d.to(self.config.device) for d in batch]
+
+                if mode == 'train':
+                    p = (epoch * len(dataloader) + pbar.n) / (self.config.epochs * len(dataloader))
+                    alpha = 2. / (1. + math.exp(-10 * p)) - 1
+                    
+                    self.optimizer.zero_grad()
+                    
+                    label_output, domain_output, recon_eeg, ortho_loss, suff_loss, kl_loss = self.model(eeg, alpha=alpha)
+                    
+                    loss_label = self.label_criterion(label_output, direction_labels)
+                    loss_domain = self.domain_criterion(domain_output, domain_labels)
+                    loss_recon = self.recon_criterion(recon_eeg, eeg)
+                    
+
+
+                    total_loss = (
+                        loss_label +
+                        loss_domain +
+                        self.config.lambda_recon * loss_recon +
+                        self.config.alpha_ortho * ortho_loss +
+                        self.config.gamma_suff * suff_loss +
+                        self.config.beta_kl * kl_loss
+                    )
+                    
+                    total_loss.backward()
+                    self.optimizer.step()
+                    
+                    self.metrics['train_total_loss'].update(total_loss.item(), eeg.size(0))
+                    self.metrics['train_label_loss'].update(loss_label.item(), eeg.size(0))
+                    self.metrics['train_domain_loss'].update(loss_domain.item(), eeg.size(0))
+                    self.metrics['train_recon_loss'].update(loss_recon.item(), eeg.size(0))
+                    self.metrics['train_ortho_loss'].update(ortho_loss.item(), eeg.size(0))
+                    self.metrics['train_suff_loss'].update(suff_loss.item(), eeg.size(0))
+                    self.metrics['train_kl_loss'].update(kl_loss.item(), eeg.size(0))
+                    self.metrics['train_label_acc'].update((label_output.argmax(1) == direction_labels).float().mean().item(), eeg.size(0))
+                    self.metrics['train_domain_acc'].update((domain_output.argmax(1) == domain_labels).float().mean().item(), eeg.size(0))
+                    
+                    pbar.set_postfix({
+                        'L_Acc': f"{self.metrics['train_label_acc'].avg:.2%}",
+                        'D_Acc': f"{self.metrics['train_domain_acc'].avg:.2%}",
+                        'Ortho': f"{self.metrics['train_ortho_loss'].avg:.4f}"
+                    })
+                else:
+                    label_output, _, _, _, _, _ = self.model(eeg, alpha=0)
+                    loss_label = self.label_criterion(label_output, direction_labels)
+                    self.metrics['test_label_loss'].update(loss_label.item(), eeg.size(0))
+                    self.metrics['test_label_acc'].update((label_output.argmax(1) == direction_labels).float().mean().item(), eeg.size(0))
+                    pbar.set_postfix({'Acc': f"{self.metrics['test_label_acc'].avg:.2%}"})
+        
+        return self.metrics
+
+    def train_epoch(self, dataloader, epoch):
+        return self.run_epoch(dataloader, mode='train', epoch=epoch)
+    
+    def test_epoch(self, dataloader, epoch):
+        metrics = self.run_epoch(dataloader, mode='test', epoch=epoch)
+        if self.lr_scheduler:
+            self.lr_scheduler.step(metrics['test_label_acc'].avg)
+        return metrics
+
+
+
+
+def run_training_session_dann(train_loader, test_loader, config, num_domain_classes, fold_save_dir):
+    model = Disentangled_NeuroMask(
+        chn=config.channel_size,
+        time_sample_num=config.time_sample_num,
+        patch_size=config.patch_size,
+        spa_dim=config.spa_dim,
+        num_direction_classes=2,
+        num_domain_classes=num_domain_classes,
+        emb_size=config.emb_size,
+        depth=config.depth,
+        num_heads=config.num_heads,
+        use_neuromask=True
+    ).to(config.device)
+    
+    optimizer = optim.AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
+    lr_scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, "max", patience=config.patience, factor=config.factor)
+    trainer = DannTrainer(model, optimizer, lr_scheduler, config)
+    
+    best_test_acc = 0
+    training_history = []
+    
+    print(f"--- Starting NeuroMask Disentangled DANN Training ({num_domain_classes} domains) ---")
+    for epoch in range(config.epochs):
+        train_metrics = trainer.train_epoch(train_loader, epoch=epoch)
+        test_metrics = trainer.test_epoch(test_loader, epoch=epoch)
+        test_acc = test_metrics['test_label_acc'].avg
+        
+        epoch_info = {
+            'epoch': epoch + 1,
+            'train_label_loss': train_metrics['train_label_loss'].avg,
+            'train_domain_loss': train_metrics['train_domain_loss'].avg,
+            'train_recon_loss': train_metrics['train_recon_loss'].avg,
+            'train_ortho_loss': train_metrics['train_ortho_loss'].avg,
+            'train_suff_loss': train_metrics['train_suff_loss'].avg,
+            'train_kl_loss': train_metrics['train_kl_loss'].avg,
+            'train_label_acc': train_metrics['train_label_acc'].avg,
+            'domain_acc': train_metrics['train_domain_acc'].avg,
+            'test_label_acc': test_acc,
+            'learning_rate': get_lr(optimizer)
+        }
+        training_history.append(epoch_info)
+        
+        if (epoch + 1) % 10 == 0 or epoch == config.epochs - 1:
+            print(f"Epoch {epoch+1:03d}/{config.epochs} | L_Acc: {epoch_info['train_label_acc']:.2%}, D_Acc: {epoch_info['domain_acc']:.2%}, Test: {epoch_info['test_label_acc']:.2%}")
+
+        if test_acc > best_test_acc:
+            best_test_acc = test_acc
+            torch.save({
+                'model_state_dict': model.state_dict(),
+                'acc': best_test_acc
+            }, os.path.join(fold_save_dir, "best_model.pt"))
+
+    print(f"Fold training complete! Best Test Accuracy: {best_test_acc:.4f}\n")
+    
+
+    pd.DataFrame(training_history).to_csv(os.path.join(fold_save_dir, "training_history.csv"), index=False)
+    
+
+
+    checkpoint = torch.load(
+        os.path.join(fold_save_dir, "best_model.pt"),
+        map_location=config.device
+    )
+    model.load_state_dict(checkpoint['model_state_dict'])
+
+    mean_attention = average_nsaf_attention(model, test_loader, config.device)
+    if mean_attention is not None:
+        view_names = ["Full Signal"] + list(get_spatial_regions_32().keys())
+        attention_df = pd.DataFrame({
+            "view": view_names,
+            "mean_attention": mean_attention
+        })
+        attention_df.to_csv(
+            os.path.join(fold_save_dir, "nsaf_attention_test_subject.csv"),
+            index=False
+        )
+        print("\nMean sample-dependent NSAF attention on held-out subject:")
+        print(attention_df.to_string(index=False))
+
+    return best_test_acc
+
+
+
+class TrainingConfig:
+    def __init__(self):
+        self.dataset_name = "KUL_Disentangled_NeuroMask_SameAs_DTU"
+        self.data_root = "/share/workspace/Yuan/qiushi/AADdataset/KUL/"
+        self.save_dir = "./KUL_Disentangled_NeuroMask_results"
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        # KUL settings from the supplied KUL code
+        self.batch_size = 128
+        self.num_workers = 4
+        self.learning_rate = 1e-4
+        self.epochs = 100
+        self.weight_decay = 1e-3
+        self.patience = 10
+        self.factor = 0.5
+
+        # Loss weights kept from the DTU model
+        self.lambda_recon = 0.5
+        self.alpha_ortho = 3.0
+        self.gamma_suff = 0.2
+        self.beta_kl = 0.001
+
+        # KUL dimensions
+        self.channel_size = 64
+        self.time_sample_num = 128
+        self.patch_size = 16
+
+        # DTU model dimensions unchanged
+        self.spa_dim = 16
+        self.emb_size = 128
+        self.depth = 2
+        self.num_heads = 8
+
+        # KUL has 16 subjects
+        self.all_subject_ids = [str(i) for i in range(1, 17)]
+
+        # 0 = all 16 LOSO folds. Set to 5 to resume from subject 6.
+        self.start_fold_index = 0
+
+        self.timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+
+def main():
+    try:
+        set_seed(42)
+        config = TrainingConfig()
+
+        main_results_dir = f"{config.save_dir}_{config.timestamp}"
+        os.makedirs(main_results_dir, exist_ok=True)
+
+        print("=" * 80)
+        print(
+            f"Task: LOSO-CV - SAME DTU Disentangled_NeuroMask model "
+            f"trained on {config.dataset_name}"
+        )
+        print(f"Data Path: {config.data_root}")
+        print(f"Results Path: {main_results_dir}")
+        print("=" * 80)
+
+        all_subject_ids = config.all_subject_ids
+        subjects_to_process = all_subject_ids[config.start_fold_index:]
+
+        if config.start_fold_index > 0:
+            print(
+                f"Resuming from fold {config.start_fold_index + 1}; "
+                f"skipping subjects: {all_subject_ids[:config.start_fold_index]}"
+            )
+
+        all_folds_results = []
+
+        for i, test_subject_id in enumerate(subjects_to_process):
+            fold_num = config.start_fold_index + i + 1
+
+            print(
+                f"\n{'=' * 30} "
+                f"FOLD {fold_num}/{len(all_subject_ids)} "
+                f"(Test Subject: {test_subject_id}) "
+                f"{'=' * 30}"
+            )
+
+            fold_save_dir = os.path.join(
+                main_results_dir,
+                f"fold_{fold_num}_test_sub{test_subject_id}"
+            )
+            os.makedirs(fold_save_dir, exist_ok=True)
+
+            # LOSO:
+            # The held-out subject is NEVER included in the training domains.
+            train_ids = [
+                sid for sid in all_subject_ids
+                if sid != test_subject_id
+            ]
+
+            domain_map = {
+                s_id: idx for idx, s_id in enumerate(train_ids)
+            }
+
+            print(f"Train Subjects ({len(train_ids)}): {train_ids}")
+            print(f"Test Subject: {test_subject_id}")
+
+            train_dataset = KUL_AAD_Dataset(
+                config.data_root,
+                train_ids,
+                domain_map
+            )
+            test_dataset = KUL_AAD_Dataset(
+                config.data_root,
+                [test_subject_id],
+                domain_map
+            )
+
+            train_loader = DataLoader(
+                train_dataset,
+                batch_size=config.batch_size,
+                shuffle=True,
+                num_workers=config.num_workers,
+                pin_memory=True
+            )
+
+            test_loader = DataLoader(
+                test_dataset,
+                batch_size=config.batch_size,
+                shuffle=False,
+                num_workers=config.num_workers,
+                pin_memory=True
+            )
+
+            print(f"Train samples: {len(train_dataset)}")
+            print(f"Test samples:  {len(test_dataset)}")
+
+            best_acc_for_fold = run_training_session_dann(
+                train_loader,
+                test_loader,
+                config,
+                num_domain_classes=len(train_ids),
+                fold_save_dir=fold_save_dir
+            )
+
+            all_folds_results.append({
+                "fold": fold_num,
+                "test_subject": test_subject_id,
+                "best_accuracy": best_acc_for_fold
+            })
+
+        print("\n" + "=" * 80)
+        print("All processed KUL LOSO folds completed!")
+        print("=" * 80)
+
+        results_df = pd.DataFrame(all_folds_results)
+
+        if len(results_df) > 0:
+            mean_accuracy = results_df["best_accuracy"].mean()
+            std_accuracy = results_df["best_accuracy"].std(ddof=0)
+
+            print(results_df.to_string(index=False))
+            print(
+                f"\nAverage Accuracy: "
+                f"{mean_accuracy:.4f} ± {std_accuracy:.4f}"
+            )
+
+            summary_data = {
+                "dataset": config.dataset_name,
+                "mean_accuracy": float(mean_accuracy),
+                "std_dev_accuracy": float(std_accuracy),
+                "processed_subjects": subjects_to_process,
+                "config": {
+                    k: str(v) if isinstance(v, torch.device) else v
+                    for k, v in vars(config).items()
+                },
+                "results": all_folds_results
+            }
+
+            with open(
+                os.path.join(main_results_dir, "summary.json"),
+                "w"
+            ) as f:
+                json.dump(summary_data, f, indent=4)
+
+            results_df.to_csv(
+                os.path.join(main_results_dir, "summary.csv"),
+                index=False
+            )
+
+            print(f"Results saved to: {main_results_dir}")
+
+    except Exception as e:
+        print(f"\n❌ Error: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+if __name__ == "__main__":
+    main()
